@@ -1,0 +1,7 @@
+/backend/.venv/
+/backend/pikpak_hub.db
+/backend/**/*.pyc
+/backend/.env
+/frontend/node_modules/
+/frontend/.next/
+/frontend/.env.local

@@ -1,0 +1,71 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pikpak:your_password@db:5432/pikpak_hub
+      REDIS_URL: redis://redis:6379/0
+      RUN_WORKER_INLINE: "false"
+      AUTO_CREATE_TABLES: "false"
+    depends_on:
+      - redis
+      - db
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  celery-worker:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pikpak:your_password@db:5432/pikpak_hub
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+      - db
+    command: celery -A app.workers.celery_app worker --loglevel=info
+
+  celery-beat:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: /api/v1
+        BACKEND_INTERNAL_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: /api/v1
+      BACKEND_INTERNAL_URL: http://backend:8000
+    depends_on:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: pikpak_hub
+      POSTGRES_USER: pikpak
+      POSTGRES_PASSWORD: your_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+volumes:
+  redis_data:
+  pg_data:
