@@ -1276,8 +1276,7 @@ async def _resolve_play_url_for_task(
                 expires_at=pikpak_url_expire_epoch(cached_url),
             )
 
-    file_id = str(target_row.file_id if target_row and target_row.file_id else (task.file_id or ""))
-    if not file_id:
+    async def _play_url_from_download_json() -> TaskPlayUrlResponse | None:
         log.info("play_url_cold_populate job_id=%s user_id=%s file_index=%s", job_id, user_id, file_index)
         resp = await _redirect_to_provider_download(
             db=db,
@@ -1285,30 +1284,41 @@ async def _resolve_play_url_for_task(
             user_id=user_id,
             return_json=True,
         )
-        if isinstance(resp, JSONResponse):
-            payload = json.loads(resp.body.decode())
-            files = payload.get("files") if isinstance(payload.get("files"), list) else []
-            if files and 0 <= file_index < len(files):
-                it = files[file_index]
-                if isinstance(it, dict):
-                    u = str(it.get("url") or "").strip()
-                    fid = str(it.get("file_id") or "").strip()
-                    if u and fid:
-                        return TaskPlayUrlResponse(
-                            url=u,
-                            file_id=fid,
-                            from_cache=False,
-                            expires_at=pikpak_url_expire_epoch(u),
-                        )
-            u = str(payload.get("url") or "").strip()
-            fid = str(payload.get("file_id") or "").strip()
-            if u and fid:
-                return TaskPlayUrlResponse(
-                    url=u,
-                    file_id=fid,
-                    from_cache=False,
-                    expires_at=pikpak_url_expire_epoch(u),
-                )
+        if not isinstance(resp, JSONResponse):
+            return None
+        payload = json.loads(resp.body.decode())
+        files = payload.get("files") if isinstance(payload.get("files"), list) else []
+        if files and 0 <= file_index < len(files):
+            it = files[file_index]
+            if isinstance(it, dict):
+                u = str(it.get("url") or "").strip()
+                fid = str(it.get("file_id") or "").strip()
+                if u and fid:
+                    return TaskPlayUrlResponse(
+                        url=u,
+                        file_id=fid,
+                        from_cache=False,
+                        expires_at=pikpak_url_expire_epoch(u),
+                    )
+        u = str(payload.get("url") or "").strip()
+        fid = str(payload.get("file_id") or "").strip()
+        if u and fid:
+            return TaskPlayUrlResponse(
+                url=u,
+                file_id=fid,
+                from_cache=False,
+                expires_at=pikpak_url_expire_epoch(u),
+            )
+        return None
+
+    # 无 DB 缓存时优先走 download?format=json（可展开文件夹型磁力）；避免对文件夹 file_id 直接取链失败
+    if not cached_rows:
+        cold = await _play_url_from_download_json()
+        if cold:
+            return cold
+
+    file_id = str(target_row.file_id if target_row and target_row.file_id else (task.file_id or ""))
+    if not file_id:
         raise HTTPException(status_code=503, detail=_USER_DOWNLOAD_RETRY_MSG)
 
     account = await db.get(PikPakAccount, task.pikpak_account_id)

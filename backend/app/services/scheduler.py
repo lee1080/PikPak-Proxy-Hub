@@ -4,8 +4,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.pikpak_account import PikPakAccount
-
-_rr_pointer: dict[str, int] = {"FREE": 0, "PREMIUM": 0}
+from app.services.hub_meta_store import get_rr_pointer, set_rr_pointer
 
 
 async def pick_account(
@@ -24,13 +23,13 @@ async def pick_account(
     if not pool:
         return None
 
-    idx = _rr_pointer.get(pool_type, 0)
+    idx = await get_rr_pointer(db, pool_type)
     n = len(pool)
     for i in range(n):
         candidate = pool[(idx + i) % n]
         free_space = int(candidate.quota_total) - int(candidate.quota_used)
         if free_space >= required_size:
-            _rr_pointer[pool_type] = (idx + i + 1) % n
+            await set_rr_pointer(db, pool_type, (idx + i + 1) % n)
             return candidate
     return None
 

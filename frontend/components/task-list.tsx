@@ -38,19 +38,61 @@ const STATUS: Record<string, { Icon: typeof Clock; color: string; label: string 
 type DownloadJson = {
   url?: string;
   file_id?: string;
-  files?: { file_id?: string; name?: string; size?: number; url?: string; episode_key?: string | null }[];
-  // 后端 items 主要用于“展示清单”，通常不带 url；但为了兼容回源填充/历史缓存，这里允许出现 url 字段
-  items?: { file_id?: string; name?: string; size?: number; url?: string; episode_key?: string | null }[];
+  files?: { file_id?: string; name?: string; size?: number; episode_key?: string | null }[];
+  items?: { file_id?: string; name?: string; size?: number; episode_key?: string | null }[];
 };
+
+type PlayUrlResponse = {
+  url: string;
+  file_id: string;
+  from_cache?: boolean;
+  expires_at?: number | null;
+};
+
+type ListedFile = {
+  file_id?: string;
+  name: string;
+  size?: number;
+  episode_key?: string | null;
+};
+
+function parseFileList(json: DownloadJson | null): ListedFile[] {
+  const base =
+    Array.isArray(json?.items) && json.items.length > 0
+      ? json.items
+      : Array.isArray(json?.files)
+        ? json.files
+        : [];
+  const listed = base
+    .map((f) => ({
+      file_id: f?.file_id ? String(f.file_id) : undefined,
+      name: String(f?.name || "文件"),
+      size: typeof f?.size === "number" ? f.size : undefined,
+      episode_key: typeof f?.episode_key === "string" ? f.episode_key : null,
+    }))
+    .filter((f) => !!f.file_id || !!f.name);
+  if (listed.length > 0) return listed;
+  if (json?.file_id || json?.url) {
+    return [{ file_id: json.file_id, name: "主文件", size: undefined, episode_key: null }];
+  }
+  return [];
+}
+
+async function copyText(text: string): Promise<void> {
+  if (!text || typeof window === "undefined") return;
+  try {
+    await window.navigator.clipboard.writeText(text);
+  } catch {
+    window.prompt("复制失败，请手动复制以下链接：", text);
+  }
+}
 
 function DownloadLink({ task }: { task: TaskRow }) {
   const [opening, setOpening] = useState(false);
   const [copying, setCopying] = useState(false);
   const [m3uing, setM3uing] = useState(false);
   const [expanded, setExpanded] = useState(false);
-  const [moreFiles, setMoreFiles] = useState<
-    { file_id?: string; name: string; url?: string; size?: number; episode_key?: string | null }[]
-  >([]);
+  const [moreFiles, setMoreFiles] = useState<ListedFile[]>([]);
 
   function shouldInvalidateFromError(ex: unknown): boolean {
     if (!axios.isAxiosError(ex)) return false;
@@ -76,123 +118,25 @@ function DownloadLink({ task }: { task: TaskRow }) {
     }
   }
 
-  async function fetchSignedRel(): Promise<string | null> {
-    // 用于“只拉清单不打开”的场景：不要走 resolve_provider 以免被 provider_url 快速路径短路
+  /** 与 LiteEmby 播放一致：GET /tasks/{id}/play-url?file_index=N */
+  async function fetchPlayUrl(fileIndex: number): Promise<string | null> {
     return await withInvalidateRetry(async () => {
-      const { data } = await api.post<{ url: string }>(`/tasks/${task.job_id}/download-link`, undefined);
-      return data?.url || null;
-    });
-  }
-
-  async function fetchFilesJson(rel: string): Promise<DownloadJson | null> {
-    const path = rel.startsWith("/api/v1") ? rel.slice("/api/v1".length) : rel;
-    const { data } = await api.get<DownloadJson>(path, { params: { format: "json" } });
-    return data || null;
-  }
-
-  function normalizeListed(resolved: DownloadJson | null): {
-    primary: string | null;
-    listed: { file_id?: string; name: string; url?: string; size?: number; episode_key?: string | null }[];
-  } {
-    const byId = new Map<string, { url?: string; episode_key?: string | null }>();
-    if (Array.isArray(resolved?.files)) {
-      for (const f of resolved.files) {
-        const id = String(f?.file_id || "");
-        if (!id) continue;
-        byId.set(id, {
-          url: typeof f?.url === "string" && f.url.startsWith("http") ? f.url : undefined,
-          episode_key: typeof f?.episode_key === "string" ? f.episode_key : null,
-        });
-      }
-    }
-    const base = Array.isArray(resolved?.items) && resolved!.items!.length > 0
-      ? resolved!.items!
-      : Array.isArray(resolved?.files)
-        ? resolved!.files!
-        : [];
-    const listed = base
-      .map((f) => {
-        const id = String(f?.file_id || "");
-        const m = id ? byId.get(id) : undefined;
-        const url =
-          (typeof f?.url === "string" && f.url.startsWith("http") ? f.url : undefined) ||
-          m?.url;
-        return {
-          file_id: id || undefined,
-          name: String(f?.name || "文件"),
-          url,
-          size: typeof f?.size === "number" ? f.size : undefined,
-          episode_key:
-            typeof f?.episode_key === "string"
-              ? f.episode_key
-              : (m?.episode_key ?? null),
-        };
-      })
-      .filter((f) => !!f.file_id || !!f.url);
-    const primary =
-      (resolved?.url && String(resolved.url).startsWith("http") ? String(resolved.url) : null) ||
-      listed.find((x) => !!x.url)?.url ||
-      null;
-    return { primary, listed };
-  }
-
-  async function resolveItemUrl(item: { file_id?: string; url?: string }): Promise<string | null> {
-    if (item.url && item.url.startsWith("http")) return item.url;
-    if (!item.file_id) return null;
-    return await withInvalidateRetry(async () => {
-      const { data } = await api.get<{ url?: string }>(`/tasks/${task.job_id}/file-link`, {
-        params: { file_id: item.file_id },
+      const { data } = await api.get<PlayUrlResponse>(`/tasks/${task.job_id}/play-url`, {
+        params: { file_index: fileIndex },
       });
-      return data?.url && data.url.startsWith("http") ? data.url : null;
+      const url = data?.url?.trim();
+      return url && url.startsWith("http") ? url : null;
     });
   }
 
-  async function fetchSignedBundle(): Promise<{
-    primary: string | null;
-    more: { file_id?: string; name: string; url?: string; size?: number; episode_key?: string | null }[];
-    hubFallback: string | null;
-  }> {
-    let rel: string;
-    let providerHint: string | null = null;
-    const got = await withInvalidateRetry(async () => {
-      try {
-        const { data } = await api.post<{
-          url: string;
-          provider_url?: string | null;
-        }>(`/tasks/${task.job_id}/download-link`, undefined, {
-          params: { resolve_provider: true },
-        });
-        return { rel: data?.url || null, providerHint: data?.provider_url || null };
-      } catch {
-        const { data } = await api.post<{ url: string }>(
-          `/tasks/${task.job_id}/download-link`,
-          undefined,
-        );
-        return { rel: data?.url || null, providerHint: null };
-      }
+  /** 仅拉文件清单（元数据），不取直链 */
+  async function fetchFileList(): Promise<ListedFile[]> {
+    return await withInvalidateRetry(async () => {
+      const { data } = await api.get<DownloadJson>(`/download/${task.job_id}`, {
+        params: { format: "json" },
+      });
+      return parseFileList(data || null);
     });
-
-    if (got.providerHint && got.providerHint.startsWith("http")) providerHint = got.providerHint;
-    if (!got.rel) return { primary: null, more: [], hubFallback: null };
-    rel = got.rel;
-
-    const hubAbs =
-      rel.startsWith("http")
-        ? rel
-        : typeof window !== "undefined"
-          ? `${window.location.origin}${rel.startsWith("/") ? "" : "/"}${rel}`
-          : rel;
-
-    try {
-      const resolved = await fetchFilesJson(rel);
-      const { primary, listed } = normalizeListed(resolved);
-      const chosen = primary || providerHint;
-      const more = listed;
-      return { primary: chosen, more, hubFallback: chosen ? null : hubAbs };
-    } catch {
-      // JSON 不可用时回退：仍可用 providerHint 或 Hub 302
-      return { primary: providerHint, more: [], hubFallback: providerHint ? null : hubAbs };
-    }
   }
 
   async function handleDownload() {
@@ -200,12 +144,12 @@ function DownloadLink({ task }: { task: TaskRow }) {
     try {
       setOpening(true);
       setMoreFiles([]);
-      const { primary, more, hubFallback } = await fetchSignedBundle();
-      setMoreFiles(more);
-      if (more.length > 0) setExpanded(true);
-      const openUrl = primary || hubFallback;
-      if (!openUrl || typeof window === "undefined") return;
-      window.open(openUrl, "_blank", "noopener,noreferrer");
+      const listed = await fetchFileList();
+      setMoreFiles(listed);
+      if (listed.length > 1) setExpanded(true);
+      const url = await fetchPlayUrl(0);
+      if (!url || typeof window === "undefined") return;
+      window.open(url, "_blank", "noopener,noreferrer");
     } finally {
       setOpening(false);
     }
@@ -216,14 +160,9 @@ function DownloadLink({ task }: { task: TaskRow }) {
     setExpanded(next);
     if (!next) return;
     if (moreFiles.length > 0) return;
-    // 仅展开列表，不自动打开
     try {
       setOpening(true);
-      const rel = await fetchSignedRel();
-      if (!rel) return;
-      const resolved = await fetchFilesJson(rel);
-      const { listed } = normalizeListed(resolved);
-      setMoreFiles(listed);
+      setMoreFiles(await fetchFileList());
     } finally {
       setOpening(false);
     }
@@ -233,17 +172,16 @@ function DownloadLink({ task }: { task: TaskRow }) {
     if (copying) return;
     try {
       setCopying(true);
-      const { primary, more, hubFallback } = await withInvalidateRetry(fetchSignedBundle);
-      const itemUrls = (await Promise.all(more.map((m) => resolveItemUrl(m)))).filter(Boolean) as string[];
-      const lines = [primary, ...itemUrls, hubFallback].filter(Boolean) as string[];
-      const text = lines.join("\n");
-      if (!text || typeof window === "undefined") return;
-      try {
-        await window.navigator.clipboard.writeText(text);
-      } catch {
-        // 常见于 Document not focused / Permissions Policy / Safari 等：降级为手动复制
-        window.prompt("复制失败，请手动复制以下链接：", text);
+      const listed = moreFiles.length > 0 ? moreFiles : await fetchFileList();
+      if (listed.length > 1) setMoreFiles(listed);
+      const count = Math.max(1, listed.length);
+      const urls: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const url = await fetchPlayUrl(i);
+        if (url) urls.push(url);
       }
+      if (urls.length === 0) return;
+      await copyText(urls.join("\n"));
     } finally {
       setCopying(false);
     }
@@ -253,17 +191,14 @@ function DownloadLink({ task }: { task: TaskRow }) {
     if (m3uing) return;
     try {
       setM3uing(true);
-      const rel = await fetchSignedRel();
-      if (!rel || typeof window === "undefined") return;
-      const path = rel.startsWith("/api/v1") ? rel.slice("/api/v1".length) : rel;
       const { data } = await withInvalidateRetry(async () => {
-        return await api.get<string>(path, {
+        return await api.get<string>(`/download/${task.job_id}`, {
           params: { format: "m3u" },
           responseType: "text",
         });
       });
       const text = typeof data === "string" ? data : "";
-      if (!text.trim()) return;
+      if (!text.trim() || typeof window === "undefined") return;
       const blob = new Blob([text], { type: "application/x-mpegURL;charset=utf-8" });
       const href = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -282,38 +217,38 @@ function DownloadLink({ task }: { task: TaskRow }) {
   return (
     <div className="inline-flex flex-col items-start gap-1">
       <div className="inline-flex items-center gap-2">
-      <button
-        type="button"
-        onClick={handleDownload}
-        disabled={opening}
-        className="bg-accent/20 text-accent hover:bg-accent/30 px-4 py-2 rounded-lg inline-flex items-center gap-2 transition-colors whitespace-nowrap"
-      >
-        <Download size={16} /> {opening ? "生成中..." : "取回"}
-      </button>
-      <button
-        type="button"
-        onClick={handleCopyLink}
-        disabled={copying}
-        className="bg-white/10 text-white/80 hover:bg-white/15 px-3 py-2 rounded-lg inline-flex items-center transition-colors whitespace-nowrap text-xs"
-      >
-        {copying ? "复制中..." : "复制链接"}
-      </button>
-      <button
-        type="button"
-        onClick={() => void handleToggleFiles()}
-        disabled={opening}
-        className="bg-white/10 text-white/80 hover:bg-white/15 px-3 py-2 rounded-lg inline-flex items-center transition-colors whitespace-nowrap text-xs"
-      >
-        {expanded ? "收起文件" : "选择文件"}
-      </button>
-      <button
-        type="button"
-        onClick={() => void handleDownloadM3U()}
-        disabled={m3uing}
-        className="bg-white/10 text-white/80 hover:bg-white/15 px-3 py-2 rounded-lg inline-flex items-center transition-colors whitespace-nowrap text-xs"
-      >
-        {m3uing ? "生成M3U..." : "下载M3U"}
-      </button>
+        <button
+          type="button"
+          onClick={handleDownload}
+          disabled={opening}
+          className="bg-accent/20 text-accent hover:bg-accent/30 px-4 py-2 rounded-lg inline-flex items-center gap-2 transition-colors whitespace-nowrap"
+        >
+          <Download size={16} /> {opening ? "生成中..." : "取回"}
+        </button>
+        <button
+          type="button"
+          onClick={handleCopyLink}
+          disabled={copying}
+          className="bg-white/10 text-white/80 hover:bg-white/15 px-3 py-2 rounded-lg inline-flex items-center transition-colors whitespace-nowrap text-xs"
+        >
+          {copying ? "复制中..." : "复制链接"}
+        </button>
+        <button
+          type="button"
+          onClick={() => void handleToggleFiles()}
+          disabled={opening}
+          className="bg-white/10 text-white/80 hover:bg-white/15 px-3 py-2 rounded-lg inline-flex items-center transition-colors whitespace-nowrap text-xs"
+        >
+          {expanded ? "收起文件" : "选择文件"}
+        </button>
+        <button
+          type="button"
+          onClick={() => void handleDownloadM3U()}
+          disabled={m3uing}
+          className="bg-white/10 text-white/80 hover:bg-white/15 px-3 py-2 rounded-lg inline-flex items-center transition-colors whitespace-nowrap text-xs"
+        >
+          {m3uing ? "生成M3U..." : "下载M3U"}
+        </button>
       </div>
       {expanded && moreFiles.length > 0 && (
         <div className="text-xs text-white/60 max-w-md">
@@ -328,7 +263,7 @@ function DownloadLink({ task }: { task: TaskRow }) {
                   className="text-accent hover:underline truncate max-w-[320px] text-left"
                   title={f.name}
                   onClick={async () => {
-                    const url = await resolveItemUrl(f);
+                    const url = await fetchPlayUrl(i);
                     if (!url) return;
                     window.open(url, "_blank", "noopener,noreferrer");
                   }}
@@ -341,13 +276,9 @@ function DownloadLink({ task }: { task: TaskRow }) {
                   type="button"
                   className="text-white/70 hover:text-white underline decoration-white/20 hover:decoration-white/40"
                   onClick={async () => {
-                    const url = await resolveItemUrl(f);
+                    const url = await fetchPlayUrl(i);
                     if (!url) return;
-                    try {
-                      await window.navigator.clipboard.writeText(url);
-                    } catch {
-                      window.prompt("复制失败，请手动复制以下链接：", url);
-                    }
+                    await copyText(url);
                   }}
                 >
                   复制
@@ -386,14 +317,10 @@ export function TaskList({ authed }: { authed: boolean }) {
           >
             {cleanupTasks.isPending ? "清理中..." : "清除已过期"}
           </button>
-          {(isFetching && !isLoading) && (
-            <span className="text-xs text-white/40">刷新中...</span>
-          )}
+          {isFetching && !isLoading && <span className="text-xs text-white/40">刷新中...</span>}
         </div>
       </div>
-      {isLoading && (
-        <p className="text-white/50 text-center py-12">加载中...</p>
-      )}
+      {isLoading && <p className="text-white/50 text-center py-12">加载中...</p>}
       {!isLoading &&
         data.map((task) => {
           const cfg = STATUS[task.status] || STATUS.PENDING;
@@ -434,9 +361,7 @@ export function TaskList({ authed }: { authed: boolean }) {
                   </div>
                 )}
               </div>
-              {task.status === "COMPLETED" && task.download_url && (
-                <DownloadLink task={task} />
-              )}
+              {task.status === "COMPLETED" && task.download_url && <DownloadLink task={task} />}
               <button
                 type="button"
                 className="text-xs text-white/45 hover:text-destructive disabled:text-white/20 transition-colors whitespace-nowrap"
